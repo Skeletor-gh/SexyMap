@@ -9,6 +9,8 @@ local ldbi = LibStub("LibDBIcon-1.0")
 local moving, ButtonFadeOut
 
 local animFrames = {}
+local managedFrames = {} -- Button name -> frame that gets positioned
+local addonButtons = {} -- Non-LibDBIcon addon buttons we have taken ownership of
 local blizzButtons = {
 	GameTimeFrame = L["Calendar"],
 	MiniMapTracking = L["Tracking Button"],
@@ -53,26 +55,17 @@ local options = {
 		custom = {
 			type = "group",
 			name = L["Addon Buttons"],
-			disabled = function()
-				return not mod.db.controlVisibility
-			end,
 			args = {},
 			order = 3,
 		},
 		dynamic = {
 			type = "group",
 			name = L["Dynamic Buttons"],
-			disabled = function()
-				return not mod.db.controlVisibility
-			end,
 			args = {},
 			order = 2,
 		},
 		stock = {
 			type = "group",
-			disabled = function()
-				return not mod.db.controlVisibility
-			end,
 			name = L["Standard Buttons"],
 			args = {},
 			order = 1,
@@ -105,11 +98,33 @@ local options = {
 				mod.db.lockDragging = v
 			end
 		},
+		enforcePositions = {
+			type = "toggle",
+			name = L.enforcePositions,
+			desc = L.enforcePositionsDesc,
+			width = "full",
+			order = 102.1,
+			disabled = function()
+				return not mod.db.allowDragging
+			end,
+			get = function()
+				return mod.db.enforcePositions
+			end,
+			set = function(info, v)
+				mod.db.enforcePositions = v
+				if v then mod:UpdateDraggables() end
+			end
+		},
 		dragRadius = {
 			type = "range",
 			name = L["Drag Radius"],
-			min = -30,
-			max = 100,
+			desc = function()
+				return L.radiusDesc:format(Minimap:GetWidth() / 2 + mod.db.radius)
+			end,
+			min = -150,
+			max = 250,
+			softMin = -50,
+			softMax = 100,
 			step = 1,
 			order = 103,
 			disabled = function()
@@ -140,6 +155,20 @@ local options = {
 				mod.db.scale = v
 				mod:UpdateDraggables()
 			end,
+		},
+		grabAddonButtons = {
+			type = "toggle",
+			name = L.grabAddonButtons,
+			desc = L.grabAddonButtonsDesc,
+			width = "full",
+			order = 104.1,
+			get = function()
+				return mod.db.grabAddonButtons
+			end,
+			set = function(info, v)
+				mod.db.grabAddonButtons = v
+				if v then mod:ScanForAddonButtons() end
+			end
 		},
 		visSpacer = {
 			order = 105,
@@ -178,20 +207,61 @@ do
 		["hover"] = L["On Hover"],
 	}
 
+	local function visDisabled()
+		return not mod.db.controlVisibility
+	end
+
+	local function dragDisabled()
+		return not mod.db.allowDragging
+	end
+
+	-- Options are nested in a group per button, so the button name is the parent key
 	local function hideGet(info, v)
-		return (mod.db.visibilitySettings[info[#info]] or "hover") == v
+		return (mod.db.visibilitySettings[info[#info-1]] or "hover") == v
 	end
 
 	local function hideSet(info, value)
-		local name = info[#info]
+		local name = info[#info-1]
 		mod.db.visibilitySettings[name] = value
-		for k,v in next, buttonNicknames do
-			if v == name then
-				mod:ChangeFrameVisibility(k, value)
-				return
-			end
-		end
-		mod:ChangeFrameVisibility(_G[name], value)
+		mod:ChangeFrameVisibility(managedFrames[name] or _G[name], value)
+	end
+
+	local function angleGet(info)
+		return mod:GetButtonAngle(info[#info-1])
+	end
+
+	local function angleSet(info, v)
+		local name = info[#info-1]
+		mod.db.dragPositions[name] = v
+		mod:UpdateDraggables(managedFrames[name])
+	end
+
+	local function useGlobalGet(info)
+		return not mod.db.radiusOverrides[info[#info-1]]
+	end
+
+	local function useGlobalSet(info, v)
+		local name = info[#info-1]
+		mod.db.radiusOverrides[name] = not v and mod.db.radius or nil
+		mod:UpdateDraggables(managedFrames[name])
+	end
+
+	local function radiusGet(info)
+		return mod.db.radiusOverrides[info[#info-1]] or mod.db.radius
+	end
+
+	local function radiusSet(info, v)
+		local name = info[#info-1]
+		mod.db.radiusOverrides[name] = v
+		mod:UpdateDraggables(managedFrames[name])
+	end
+
+	local function radiusDesc(info)
+		return L.radiusDesc:format(Minimap:GetWidth() / 2 + radiusGet(info))
+	end
+
+	local function radiusDisabled(info)
+		return not mod.db.allowDragging or not mod.db.radiusOverrides[info[#info-1]]
 	end
 
 	function mod:AddButtonOptions(name)
@@ -204,11 +274,54 @@ do
 			p = options.args.custom.args -- Addon icon = custom section
 		end
 		p[name] = {
-			type = "multiselect",
+			type = "group",
+			inline = true,
 			name = blizzButtons[name] or dynamicButtons[name] or name:gsub("LibDBIcon10_", "") or "???",
-			values = hideValues,
-			get = hideGet,
-			set = hideSet,
+			args = {
+				visibility = {
+					type = "multiselect",
+					name = L["Visibility"],
+					values = hideValues,
+					get = hideGet,
+					set = hideSet,
+					disabled = visDisabled,
+					order = 1,
+				},
+				angle = {
+					type = "range",
+					name = L.buttonAngle,
+					desc = L.buttonAngleDesc,
+					min = 0,
+					max = 359,
+					step = 1,
+					get = angleGet,
+					set = angleSet,
+					disabled = dragDisabled,
+					order = 2,
+				},
+				useGlobalRadius = {
+					type = "toggle",
+					name = L.useGlobalRadius,
+					get = useGlobalGet,
+					set = useGlobalSet,
+					disabled = dragDisabled,
+					order = 3,
+				},
+				radius = {
+					type = "range",
+					name = L.buttonRadius,
+					desc = radiusDesc,
+					min = -150,
+					max = 250,
+					softMin = -50,
+					softMax = 100,
+					step = 1,
+					get = radiusGet,
+					set = radiusSet,
+					disabled = radiusDisabled,
+					order = 4,
+				},
+			},
 		}
 	end
 end
@@ -246,6 +359,17 @@ function mod:OnInitialize(profile)
 	end
 
 	self.db = profile.buttons
+
+	-- Settings added after the initial profile layout
+	if type(self.db.radiusOverrides) ~= "table" then
+		self.db.radiusOverrides = {}
+	end
+	if self.db.enforcePositions == nil then
+		self.db.enforcePositions = true
+	end
+	if self.db.grabAddonButtons == nil then
+		self.db.grabAddonButtons = true
+	end
 end
 
 function mod:OnEnable()
@@ -496,8 +620,8 @@ do
 	Minimap.Layout = hideFrame.Layout
 	function mod:NewFrame(f)
 		local n = buttonNicknames[f] or f:GetName()
-		-- Only add Blizz buttons & LibDBIcon buttons
-		if blizzButtons[n] or dynamicButtons[n] or n:find("LibDBIcon") then
+		-- Only add Blizz buttons, LibDBIcon buttons & addon buttons found by :ScanForAddonButtons
+		if blizzButtons[n] or dynamicButtons[n] or n:find("LibDBIcon") or addonButtons[f] then
 			-- Create the animation
 			f.sexyMapFadeOut = f:CreateAnimationGroup()
 			local smAlphaAnimOut = f.sexyMapFadeOut:CreateAnimation("Alpha")
@@ -519,9 +643,15 @@ do
 				f:SetPoint("CENTER", Minimap, "CENTER", -60, 55)
 			elseif buttonNicknames[f] or n == "AddonCompartmentFrame" then
 				f:SetParent(Minimap)
+			elseif addonButtons[f] and f:GetParent() ~= Minimap then
+				-- Positioning assumes Minimap scale, so move buttons off MinimapBackdrop, keeping their strata
+				local strata = f:GetFrameStrata()
+				sm.core.button.SetParent(f, Minimap)
+				sm.core.button.SetFrameStrata(f, strata)
 			end
 
 			animFrames[#animFrames+1] = f
+			managedFrames[n] = f
 
 			-- Configure fading
 			if n == "TimeManagerClockButton" then -- This is disgusting but have to work around other addons messing with it
@@ -618,13 +748,39 @@ do
 		return angle
 	end
 
-	local setPosition = function(frame, angle)
-		local radius = (Minimap:GetWidth() / 2) + mod.db.radius
-		local bx, by = sm.shapes:GetPosition(angle, radius)
-		frame:SetScale(mod.db.scale)
+	-- The angle of a frame relative to the Minimap center, converting the frame's coords into Minimap coords
+	local getFrameAngle = function(frame)
+		local x, y = frame:GetCenter()
+		if not x or not y then return 0 end
+		local s = frame:GetEffectiveScale() / Minimap:GetEffectiveScale()
+		return getCurrentAngle(Minimap, x * s, y * s)
+	end
 
-		frame:ClearAllPoints()
-		frame:SetPoint("CENTER", Minimap, "CENTER", bx, by)
+	local setPosition = function(frame, angle)
+		local name = buttonNicknames[frame] or frame:GetName()
+		local radius = (Minimap:GetWidth() / 2) + (mod.db.radiusOverrides[name] or mod.db.radius)
+		local bx, by = sm.shapes:GetPosition(angle, radius)
+		local scale = mod.db.scale or 1
+
+		-- Use the raw widget functions so we don't trigger our own SetPoint hook
+		sm.core.button.SetScale(frame, scale)
+		sm.core.button.ClearAllPoints(frame)
+		-- Point offsets are in the button's own scale, compensate so the radius is in Minimap units
+		sm.core.button.SetPoint(frame, "CENTER", Minimap, "CENTER", bx / scale, by / scale)
+	end
+
+	local placeFrame = function(frame)
+		local name = buttonNicknames[frame] or frame:GetName()
+		setPosition(frame, mod.db.dragPositions[name] or getFrameAngle(frame))
+	end
+
+	function mod:GetButtonAngle(name)
+		local angle = mod.db.dragPositions[name]
+		if not angle then
+			local frame = managedFrames[name]
+			angle = frame and getFrameAngle(frame) or 0
+		end
+		return floor(angle % 360 + 0.5) % 360
 	end
 
 	local updatePosition = function()
@@ -664,21 +820,49 @@ do
 		ButtonFadeOut() -- Call the fade out function
 	end
 
+	-- Ownership: when another addon (LibDBIcon:Refresh, button bags, etc) or the default UI moves a button
+	-- that we manage, put it straight back where the user wants it.
+	local enforcePosition = function(frame)
+		if not mod.db.allowDragging or not mod.db.enforcePositions then return end
+		placeFrame(frame)
+	end
+
+	-- Same for the drag scripts, e.g. LibDBIcon:Lock/Unlock/Refresh replace them with its own drag handling
+	local dragScripts = {}
+	local enforceDragScripts = function(frame, script)
+		if (script == "OnDragStart" or script == "OnDragStop") and mod.db.allowDragging and mod.db.enforcePositions then
+			sm.core.button.SetScript(frame, "OnDragStart", dragScripts[frame][1])
+			sm.core.button.SetScript(frame, "OnDragStop", dragScripts[frame][2])
+		end
+	end
+
+	local hookedScripts, hookedPoints = {}, {}
 	function mod:MakeMovable(frame, altFrame)
 		frame:EnableMouse(true)
 		frame:RegisterForDrag("LeftButton")
+		local onDragStart = OnDragStart
 		if altFrame then
-			frame:SetScript("OnDragStart", function()
+			onDragStart = function()
 				if mod.db.lockDragging or not mod.db.allowDragging then return end
 
 				moving = altFrame
 				dragFrame:SetScript("OnUpdate", updatePosition)
-			end)
-		else
-			frame:SetScript("OnDragStart", OnDragStart)
+			end
 		end
-		frame:SetScript("OnDragStop", OnDragStop)
-		self:UpdateDraggables(altFrame or frame)
+		dragScripts[frame] = {onDragStart, OnDragStop}
+		sm.core.button.SetScript(frame, "OnDragStart", onDragStart)
+		sm.core.button.SetScript(frame, "OnDragStop", OnDragStop)
+
+		local target = altFrame or frame
+		if not hookedScripts[frame] then
+			hookedScripts[frame] = true
+			hooksecurefunc(frame, "SetScript", enforceDragScripts)
+		end
+		if not hookedPoints[target] then
+			hookedPoints[target] = true
+			hooksecurefunc(target, "SetPoint", enforcePosition)
+		end
+		self:UpdateDraggables(target)
 	end
 
 	function mod:UpdateDraggables(frame)
@@ -687,23 +871,14 @@ do
 		mod:ShowAllButtons()
 
 		if frame then
-			local x, y = frame:GetCenter()
-			local name = buttonNicknames[frame] or frame:GetName()
-			local angle = mod.db.dragPositions[name] or getCurrentAngle(frame:GetParent(), x, y)
-			if angle then
-				setPosition(frame, angle)
-			end
+			placeFrame(frame)
 		else
 			for i = 1, #animFrames do
 				local f = animFrames[i]
 				local n = buttonNicknames[f] or f:GetName()
 				-- Don't move the Clock or Zone Text when changing shape/preset
 				if n ~= "SexyMapZoneTextButton" and n ~= "TimeManagerClockButton" then
-					local x, y = f:GetCenter()
-					local angle = mod.db.dragPositions[n] or getCurrentAngle(f:GetParent(), x, y)
-					if angle then
-						setPosition(f, angle)
-					end
+					placeFrame(f)
 				end
 			end
 		end
@@ -734,6 +909,41 @@ do
 		self:NewFrame(button)
 	end
 
+	-- Named buttons on the minimap that we never want to take over
+	local ignoreButtons = {
+		QueueStatusMinimapButton = true,
+		GarrisonLandingPageMinimapButton = true,
+		MiniMapTrackingButton = true,
+		MinimapZoneTextButton = true,
+	}
+	local function IsAddonButton(f)
+		if f:IsForbidden() or f.sexyMapFadeOut or buttonNicknames[f] or addonButtons[f] then return end
+		if not f:IsObjectType("Button") or f:IsProtected() then return end
+		local n = f:GetName()
+		if not n or ignoreButtons[n] or blizzButtons[n] or dynamicButtons[n] or n:find("^LibDBIcon") or n:find("^SexyMap") then return end
+		-- Only take frames that call themselves a minimap button, so we don't grab map pins (HandyNotes, GatherMate, etc)
+		local lowerName = n:lower()
+		if not lowerName:find("minimap", nil, true) or not lowerName:find("button", nil, true) then return end
+		local w, h = f:GetSize()
+		return w > 10 and w <= 50 and h > 10 and h <= 50
+	end
+
+	-- Take ownership of addon buttons that don't use LibDBIcon
+	function mod:ScanForAddonButtons()
+		if not mod.db.grabAddonButtons or InCombatLockdown() then return end
+		local parents = {Minimap, MinimapBackdrop}
+		for i = 1, #parents do
+			local children = {parents[i]:GetChildren()}
+			for j = 1, #children do
+				local f = children[j]
+				if IsAddonButton(f) then
+					addonButtons[f] = true
+					mod:NewFrame(f)
+				end
+			end
+		end
+	end
+
 	local function CheckCalendar()
 		if not mod.db.controlVisibility then return end
 		local vis = mod.db.visibilitySettings.GameTimeFrame
@@ -756,6 +966,14 @@ do
 			mod:NewFrame(ldbi:GetMinimapButton(ldbiTbl[i]))
 		end
 		ldbi.RegisterCallback(mod, "LibDBIcon_IconCreated", "AddButton")
+
+		-- Catch addon buttons created at login, and later by load on demand addons
+		mod:ScanForAddonButtons()
+		local scanFunc = function() mod:ScanForAddonButtons() end
+		C_Timer.After(5, scanFunc)
+		local scanFrame = CreateFrame("Frame")
+		scanFrame:SetScript("OnEvent", function() C_Timer.After(1, scanFunc) end)
+		scanFrame:RegisterEvent("ADDON_LOADED")
 
 		-- If calendar is set to "hover" and we have pending invites, force show it
 		local frame = CreateFrame("Frame")
